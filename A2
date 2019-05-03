@@ -1,0 +1,362 @@
+#include <iostream>
+#include <occi.h>
+#include <termios.h>
+#include <unistd.h>
+#include <stdlib.h>
+using namespace std;
+using namespace oracle::occi;
+
+// Read Oracle password to establish connection
+string readPassword()
+{
+    struct termios settings;
+    tcgetattr( STDIN_FILENO, &settings );
+    settings.c_lflag =  (settings.c_lflag & ~(ECHO));
+    tcsetattr( STDIN_FILENO, TCSANOW, &settings );
+    
+    string password = "";
+    getline(cin, password);
+    
+    settings.c_lflag = (settings.c_lflag |   ECHO );
+    tcsetattr( STDIN_FILENO, TCSANOW, &settings );
+    return password;
+}
+
+// Give each prepared statement a name
+struct STMT {
+    string name;
+    Statement *stmt;
+};
+
+// Prepare the statements that would be used repeatedly
+// in this program
+int initStatements(Connection *conn, STMT * & statements)
+{
+    int size = 6;
+    statements = new STMT[size];
+    
+    // retrieve information of a given phone number
+    statements[0].name = "checkNumber";
+    string queryStr = "select * from Phone where areaCode = :1 and pnumber = :2";
+    statements[0].stmt = conn->createStatement(queryStr);
+    
+    // retrieve all phone call records from one phone number to another one
+    statements[1].name = "displayRecords";
+    queryStr = "select rid, startDate, startTime, duration\n \
+    from Call\n \
+    where fromArea = :1 and fromNumber = :2\n \
+    and toArea = :3 and toNumber = :4";
+    statements[1].stmt = conn->createStatement(queryStr);
+    
+    // remove a given phone call record from the database
+    statements[2].name = "removeCall";
+    queryStr = "delete from call where rid = :1";
+    statements[2].stmt = conn->createStatement(queryStr);
+    
+    // retrieve summary information for a given phone number
+    statements[3].name = "summaryNumber";
+    queryStr = "select billingAddress, address, sum(duration)\n \
+    from Call C, Phone P, Customer M\n \
+    where C.fromArea = P.areaCode\n \
+    and C.fromNumber = P.pnumber\n \
+    and M.cid = P.cid\n \
+    and P.areaCode = :1 and P.pnumber = :2\n \
+    group by billingAddress, address";
+    statements[3].stmt = conn->createStatement(queryStr);
+    
+    // retrieve the records of all phone calls originated from
+    // the given phone number
+    statements[4].name = "displayCalls";
+    queryStr = "select rid, toArea, toNumber, startDate, startTime, duration\n \
+    from Call\n \
+    where fromArea = :1 and fromNumber = :2";
+    statements[4].stmt = conn->createStatement(queryStr);
+    
+    // For a given month/year, retrieve summary information of every customer
+    statements[5].name = "summary";
+    queryStr = "select M.cid, M.name, M.billingAddress, count(rid)\n \
+    from Call C, Phone P, Customer M\n \
+    where C.fromArea = P.areaCode\n \
+    and C.fromNumber = P.pnumber\n \
+    and M.cid = P.cid\n \
+    and to_char(C.startDate, 'yyyy') = :1\n \
+    and to_char(C.startDate, 'mm') = :2\n \
+    group by M.cid, M.name, M.billingAddress";
+    statements[5].stmt = conn->createStatement(queryStr);
+    
+    return size;
+}
+
+// Given the name, find the corresponding prepared sql statement
+Statement * findStatement(string name, STMT *statements, int size)
+{
+    for(int i = 0; i < size; i++) {
+        if (statements[i].name == name)
+        return statements[i].stmt;
+    }
+    return 0;
+}
+
+// Terminate all the prepared statements
+void terminateStatements(Connection *conn, STMT *statements, int size)
+{
+    for(int i = 0; i < size; i++)
+    conn->terminateStatement(statements[i].stmt);
+}
+
+
+void menu()
+{
+    cout << "Enter d to display records\n"
+    << "      n to show phone line info\n"
+    << "      s to show summary\n"
+    << "  and q to shutdown\n";
+}
+
+string getCommand()
+{
+    string cmd;
+    menu();
+    cout << "Choose an option: ";
+    cin >> cmd;
+    for(unsigned int i = 0; i < cmd.length(); i++)
+    cmd[i] = tolower(cmd[i]);
+    
+    return cmd;
+}
+
+// check whether a given phone number exists
+bool checkNumber(Statement *stmt, string area, string number)
+{
+    stmt->setString(1, area);
+    stmt->setString(2, number);
+    
+    ResultSet *rs = stmt->executeQuery();
+    bool exists = rs->next();
+    
+    stmt->closeResultSet(rs);
+    return exists;
+}
+
+// read in two phone numbers and display
+// all phone calls between the two numbers
+// and maybe remove a phone call record
+void displayCallRecord(STMT *statements, int size)
+{
+    string fromArea, fromNumber, toArea, toNumber;
+    cout << "Enter two phone numbers with area code: ";
+    cin >> fromArea >> fromNumber >> toArea >> toNumber;
+    
+    Statement *stmt = findStatement("checkNumber", statements, size);
+    if (!checkNumber(stmt, fromArea, fromNumber)) {
+        cout << "Phone number (" << fromArea << ") " << fromNumber
+        << " doesn't exist.\n";
+        return;
+    }
+    
+    if (!checkNumber(stmt, toArea, toNumber)) {
+        cout << "Phone number (" << toArea << ") " << toNumber
+        << " doesn't exist.\n";
+        return;
+    }
+    
+    stmt = findStatement("displayRecords", statements, size);
+    stmt->setString(1, fromArea);
+    stmt->setString(2, fromNumber);
+    stmt->setString(3, toArea);
+    stmt->setString(4, toNumber);
+    
+    ResultSet *rs = stmt->executeQuery();
+    while (rs->next()) {
+        cout << rs->getString(1) << ": "
+        << "start at " << rs->getString(2) << " "
+        << rs->getString(3) << " "
+        << "for " << rs->getString(4) << " minutes" << endl;
+    }
+    stmt->closeResultSet(rs);
+    
+    // maybe remove a phone call record
+    cout << "Do you want to remove a record? (y/n)";
+    string answer;
+    cin >> answer;
+    if (tolower(answer[0]) == 'y') {
+        string rid;
+        cout << "Enter the rid of the call record you want to remove: ";
+        cin >> rid;
+        stmt = findStatement("removeCall", statements, size);
+        stmt->setString(1, rid);
+        int status = stmt->executeUpdate();
+        if (status > 0) {
+            cout << "Successfully removed record with rid = " << rid << endl;
+        } else {
+            cout << "Failed removing record with rid = " << rid << endl;
+        }
+    }
+}
+
+// read in a phone number and
+// display all phone calls originated from this number
+void displayRecords(STMT *statements, int size)
+{
+    string area, number;
+    cout << "Enter one phone number with area code: ";
+    cin >> area >> number;
+    
+    Statement *stmt = findStatement("checkNumber", statements, size);
+    if (!checkNumber(stmt, area, number)) {
+        cout << "Phone number (" << area << ") " << number
+        << " doesn't exist.\n";
+        return;
+    }
+    
+    stmt = findStatement("summaryNumber", statements, size);
+    stmt->setString(1, area);
+    stmt->setString(2, number);
+    ResultSet *rs = stmt->executeQuery();
+    
+    if (rs->next()) {
+        cout << "Billing Address: " << rs->getString(1) << endl;
+        cout << "Address: " << rs->getString(2) << endl;
+        cout << "Total minutes: " << rs->getFloat(3) << endl;
+    } else {
+        cout << "No phone calls made by (" << area
+        << ") " << number << endl;
+    }
+    
+    stmt->closeResultSet(rs);
+    
+    stmt = findStatement("displayCalls", statements, size);
+    stmt->setString(1, area);
+    stmt->setString(2, number);
+    rs = stmt->executeQuery();
+    
+    while (rs->next()) {
+        cout << rs->getString(1) << ": "
+        << "to (" << rs->getString(2)
+        << ")" << rs->getString(3) << ", "
+        << "start at " << rs->getString(4) << " "
+        << rs->getString(5) << " "
+        << "for " << rs->getString(6) << "minutes" << endl;
+    }
+    stmt->closeResultSet(rs);
+}
+
+bool validYear(string year)
+{
+    if (year.length() != 4)
+    return false;
+    for(int i = 0; i < 4; i++) {
+        if (!isdigit(year[i]))
+        return false;
+    }
+    return true;
+}
+
+bool validMonth(string & month)
+{
+    string names[12] = {"january", "february", "march", "april",
+        "may", "june", "july", "august",
+        "september", "october", "november", "december"};
+    string returnvalues[12] = {"01", "02", "03", "04", "05", "06",
+        "07", "08", "09", "10", "11", "12"};
+    int x = atoi(month.c_str());
+    if (x >= 1 && x <= 12) {
+        month = returnvalues[x-1];
+        return true;
+    }
+    unsigned int len = month.length();
+    if (len < 3)
+    return false;
+    bool match = false;
+    for(int i = 0; i < 12; i++) {
+        if (len <= names[i].length()) {
+            match = true;
+            for(unsigned int j = 0; j < len && match; j++) {
+                if (tolower(month[j] != names[i][j]))
+                match = false;
+            }
+        }
+        if (match) {
+            month = returnvalues[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+// read in year and month [name or number] and
+// display summary report of every customer for the given month
+void showSummary(STMT *statements, int size)
+{
+    string year, month;
+    cout << "Please enter year and then month: ";
+    cin >> year >> month;
+    
+    if (!validYear(year) || !validMonth(month)) {
+        cout << "Invalid year or month.\n";
+        return;
+    }
+    
+    Statement *stmt = findStatement("summary", statements, size);
+    stmt->setString(1, year);
+    stmt->setString(2, month);
+    
+    ResultSet *rs = stmt->executeQuery();
+    while (rs->next()) {
+        cout << "cid : " << rs->getString(1) << endl
+        << "name : " << rs->getString(2) << endl
+        << "billingaddress : " << rs->getString(3) << endl
+        << "number of calls: " << rs->getInt(4) << endl
+        << endl;
+    }
+    stmt->closeResultSet(rs);
+}
+
+int main()
+{
+    string userName;
+    string password;
+    const string connectString = "sunfire.csci.viu.ca";
+    
+    // Establish connection using userName and password
+    cout << "Your user name: ";
+    getline(cin, userName);
+    
+    cout << "Your password: ";
+    password = readPassword();
+    cout << endl;
+    
+    Environment *env = Environment::createEnvironment();
+    Connection *conn = env->createConnection
+    (userName, password, connectString);
+    
+    STMT *statements;
+    int size = initStatements(conn, statements);
+    
+    string cmd = getCommand();
+    
+    while (cmd != "q") {
+        
+        if (cmd == "d") {
+            cout << "display and delete\n";
+            displayCallRecord(statements, size);
+        } else if (cmd == "n") {
+            cout << "show records\n";
+            displayRecords(statements, size);
+        } else if (cmd == "s") {
+            cout << "show summary\n";
+            showSummary(statements, size);
+        } else {
+            cout << "Unknown command.\n";
+        }
+        
+        cmd = getCommand();
+    }
+    
+    // clean up environment before terminating
+    terminateStatements(conn, statements, size);
+    env->terminateConnection(conn);
+    Environment::terminateEnvironment(env);
+    
+    return 0;
+}
